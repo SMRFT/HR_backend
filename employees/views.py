@@ -728,11 +728,27 @@ def registration(request):
         role = request.data.get('role')
         password = request.data.get('password')
         confirm_password = request.data.get('confirmPassword')
+        fingerprint_id = request.data.get('fingerprint_id')
+        device = request.data.get('device')
+
+        # Validate password match
         if password != confirm_password:
             return Response({"error": "Passwords do not match"}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Check for duplicates
         if Register.objects.filter(name=name, role=role).exists():
             return Response({"error": "User with this name and role already exists"}, status=status.HTTP_400_BAD_REQUEST)
-        Register.objects.create(name=name, role=role, password=password)
+
+        # Create new record including fingerprint_id and device
+        Register.objects.create(
+            name=name,
+            role=role,
+            password=password,
+            confirmPassword=confirm_password,
+            fingerprint_id=fingerprint_id,
+            device=device
+        )
+
         return Response({"message": "Registration successful!"}, status=status.HTTP_201_CREATED)
     
 

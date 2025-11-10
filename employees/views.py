@@ -775,8 +775,9 @@ def login(request):
 
         device_name = user.device
         token_env_key = f"{device_name}_TOKEN"  # e.g., LAB_MAC_01_TOKEN
+        print("token_env_key",token_env_key)
         token = os.getenv(token_env_key)
-
+        print("token",token)
         if not token:
             return Response({
                 "error": f"No token found for device {device_name}. Please check environment settings."

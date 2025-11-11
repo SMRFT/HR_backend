@@ -305,7 +305,7 @@ def get_all_employee_from_global(request):
             # ✅ Add profile image URL if available
             profile_img_id = emp.get("profileImage")
             if profile_img_id:
-                emp_data["profileImage"] = f"{base_url}/serve-file/{profile_img_id}/"
+                emp_data["profileImage"] = f"{base_url}/_b_a_c_k_e_n_d/HR/serve-file/{profile_img_id}/"
 
             result.append(emp_data)
 
@@ -459,7 +459,7 @@ def encode_employee_face(request, employee_id):
             return JsonResponse({"error": "Profile image missing"}, status=400)
 
         base_url = request.build_absolute_uri('/')[:-1]
-        image_url = f"{base_url}/serve-file/{profile_img_id}/"
+        image_url = f"{base_url}/_b_a_c_k_e_n_d/HR/serve-file/{profile_img_id}/"
         resp = requests.get(image_url, timeout=10)
         resp.raise_for_status()
 

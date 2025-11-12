@@ -569,7 +569,7 @@ def to_list(encoding):
 
 
 @api_view(['POST'])
-# @permission_classes([HasRolePermission])
+@permission_classes([HasRolePermission])
 def mark_attendance(request):
     image_file = request.FILES.get('image')
     image_b64 = request.data.get('image')

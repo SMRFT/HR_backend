@@ -15,7 +15,6 @@ urlpatterns = [
     path('hrregistration/', views.registration, name='registration'),
     path('login/', views.login, name='login'),
     path('attendance-report/', views.attendance_report_with_employee_details, name='attendance_report'),
-    path("transcribe/", views.transcribe_audio, name="transcribe_audio"),
     path('fingerprint-login/', views.fingerprint_login, name='fingerprint-login'),
 
 

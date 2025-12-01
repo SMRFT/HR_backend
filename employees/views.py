@@ -828,39 +828,5 @@ def fingerprint_login(request):
     except Exception as e:
         return JsonResponse({'error': str(e)}, status=500)
 
-# app/views.py
-import os
-import tempfile
-from django.http import JsonResponse
-from django.views.decorators.csrf import csrf_exempt
-from faster_whisper import WhisperModel
 
-# load once at startup (change size as needed)
-model = WhisperModel("base", device="cpu", compute_type="int8")
 
-@csrf_exempt
-def transcribe_audio(request):
-    if request.method != "POST":
-        return JsonResponse({"error": "POST required"}, status=405)
-
-    if "file" not in request.FILES:
-        return JsonResponse({"error": "No file uploaded"}, status=400)
-
-    audio = request.FILES["file"]
-
-    # save temporarily
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
-        for chunk in audio.chunks():
-            tmp.write(chunk)
-        tmp_path = tmp.name
-
-    # run transcription
-    segments, info = model.transcribe(tmp_path)
-    text = " ".join([seg.text for seg in segments])
-
-    os.remove(tmp_path)
-    return JsonResponse({
-        "text": text,
-        "language": info.language,
-        "probability": info.language_probability,
-    })

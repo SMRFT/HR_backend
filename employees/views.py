@@ -603,14 +603,16 @@ def mark_attendance(request):
         if len(emp_encoding) == 0 or len(unknown_encoding_np) == 0:
             continue  # skip invalid encodings
 
-        match, dist = compare_encodings(emp_encoding, unknown_encoding_np)
+        # We only care about the distance here to find the absolute best match
+        # compare_encodings returns (is_match, distance)
+        _, dist = compare_encodings(emp_encoding, unknown_encoding_np)
+        
         if dist < best_distance:
             best_distance = dist
             matched_employee = emp
-            if match:
-                break
 
-    if not matched_employee or best_distance > 0.6:
+    # Check if the best match found is within our acceptable threshold (0.5)
+    if not matched_employee or best_distance > 0.5:
         return Response({"error": "No matching active employee found"}, status=404)
 
     mode = request.data.get('mode', 'IN')

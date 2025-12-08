@@ -41,8 +41,9 @@ def compare_encodings(known_encoding, unknown_encoding):
     known = np.array(known_encoding)
     unknown = np.array(unknown_encoding)
     dist = np.linalg.norm(known - unknown)
-    # threshold typical ~0.6 for face_recognition
-    return (dist <= 0.6, float(dist))
+    # threshold typical ~0.6 for face_recognition. 
+    # Adjusted to 0.5 to balance strictness and usability.
+    return (dist <= 0.5, float(dist))
 
 
 import hashlib

@@ -9,7 +9,7 @@ from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 
 from employees.models import Employee, EmployeeAttendance
-from employees.face_utils import base64_to_encoding, compare_encodings, imagefile_to_encoding
+from employees.face_utils import base64_to_encoding, compare_encodings, imagefile_to_encoding, SpoofingDetectedError
 from pyauth.auth import HasRolePermission
 
 from .utils import to_list
@@ -22,12 +22,15 @@ def mark_attendance(request):
     employee_id = request.data.get('auth-user-id')
     # print(f"Marking attendance for employee_id: {employee_id}")
     # Handle both file and base64 image input
-    if image_file:
-        unknown_encoding = imagefile_to_encoding(image_file)
-    elif image_b64:
-        unknown_encoding = base64_to_encoding(image_b64)
-    else:
-        return Response({"error": "Image is required"}, status=400)
+    try:
+        if image_file:
+            unknown_encoding = imagefile_to_encoding(image_file)
+        elif image_b64:
+            unknown_encoding = base64_to_encoding(image_b64)
+        else:
+            return Response({"error": "Image is required"}, status=400)
+    except SpoofingDetectedError:
+        return Response({"error": "Spoofing detected! Real face required."}, status=400)
 
     if not unknown_encoding:
         return Response({"error": "No face found in image"}, status=400)
@@ -59,7 +62,7 @@ def mark_attendance(request):
 
     # Check if the best match found is within our acceptable threshold (0.5)
     if not matched_employee or best_distance > 0.5:
-        return Response({"error": "No matching active employee found"}, status=404)
+        return Response({"error": "User Not Found"}, status=404)
 
     mode = request.data.get('mode', 'IN')
 

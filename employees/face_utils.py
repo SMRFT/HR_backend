@@ -6,6 +6,57 @@ import base64
 import numpy as np
 import face_recognition
 from io import BytesIO
+import cv2
+from deepface import DeepFace
+import os
+
+os.environ['DEEPFACE_LOG_LEVEL'] = 'error'
+
+class SpoofingDetectedError(Exception):
+    pass
+
+def check_liveness(img_rgb):
+    """
+    Checks if the face is real using DeepFace's Anti-Spoofing (MiniFASNet).
+    Returns True if real, False if spoof.
+    If no face is detected by DeepFace, currently returns True (fail-open) 
+    or you can change to False (fail-closed).
+    """
+    try:
+        # Convert RGB to BGR for DeepFace/OpenCV
+        img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+        
+        # Run Anti-Spoofing
+        # enforce_detection=False allows silent return if no face (though we handle it)
+        faces = DeepFace.extract_faces(
+            img_path=img_bgr,
+            detector_backend='opencv', 
+            enforce_detection=False,
+            align=False,
+            anti_spoofing=True
+        )
+        
+        if not faces:
+            # If DeepFace sees no face, we can't judge liveness.
+            # Assuming safe or let face_recognition handle it.
+            return True
+            
+        for face in faces:
+            # 'is_real' is populated by anti_spoofing=True
+            if face.get("is_real") is False:
+                # Found a spoofed face
+                return False
+                
+        return True
+        
+    except Exception as e:
+        print(f"⚠️ Anti-spoofing check error: {e}")
+        # Identify if we should fail or pass on error.
+        # For security, better to log and maybe return False?
+        # But if model loading fails, we might block legit users.
+        # Let's return False to be safe and see logs.
+        return False
+
 
 def imagefile_to_encoding(file_obj) -> list:
     """
@@ -17,6 +68,11 @@ def imagefile_to_encoding(file_obj) -> list:
             img = face_recognition.load_image_file(BytesIO(file_obj))
         else:
             img = face_recognition.load_image_file(file_obj)
+
+        # ✅ Anti-Spoofing Check
+        if not check_liveness(img):
+            print("⚠️ Spoofing attempt detected!")
+            raise SpoofingDetectedError("Spoofing attempt detected")
 
         encodings = face_recognition.face_encodings(img)
         if not encodings:

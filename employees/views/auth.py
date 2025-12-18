@@ -91,6 +91,7 @@ def login(request):
             "message": f"Login successful as {user.role}, {user.name}",
             "device": device_name,
             "name": user.name,
+            "role": user.role,
             "token": token
         }, status=200)
 
@@ -122,6 +123,7 @@ def fingerprint_login(request):
             'success': True,
             'device': device_name,
             'name': employee.name,
+            'role': employee.role,
             'token': token,
             'message': 'Fingerprint authentication successful'
         }, status=200)

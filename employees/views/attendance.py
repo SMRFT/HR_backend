@@ -131,16 +131,7 @@ def mark_attendance(request):
     if known_matrix.size == 0:
         return Response({"error": "No registered employees found"}, status=404)
 
-    def get_best_match(enc):
-        if not enc:
-            return None, 999.0
-        enc_np = np.array(enc)
-        distances = np.linalg.norm(known_matrix - enc_np, axis=1)
-        best_idx = np.argmin(distances)
-        return employee_meta[best_idx], float(distances[best_idx])
-
-    meta1, dist1 = get_best_match(enc1)
-    meta2, dist2 = get_best_match(enc2)
+    meta1, dist1, err1 = match_face_1_to_n(enc1, known_matrix, employee_meta, threshold=0.45, min_margin=0.05) if enc1 else (None, 999.0, "No encoding 1")
     
     MATCH_THRESHOLD = 0.45
     best_distance = dist1

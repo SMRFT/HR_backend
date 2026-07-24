@@ -1,7 +1,8 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 import numpy as np
 import os
 import pytz
+import traceback
 from pymongo import MongoClient
 import gridfs
 
@@ -12,10 +13,9 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 
-from employees.models import Employee, EmployeeAttendance, SpoofingAttempt
+from employees.models import Department, Employee, EmployeeAttendance, FaceMismatchLog, SpoofingAttempt
 import base64
-from employees.face_utils import base64_to_encoding, compare_encodings, imagefile_to_encoding, SpoofingDetectedError, match_face_1_to_n
-from pyauth.auth import HasRolePermission
+from employees.face_utils import base64_to_encoding, imagefile_to_encoding, match_face_1_to_n
 
 from .utils import to_list
 
@@ -145,18 +145,22 @@ def _get_device_label(request):
         
     return "unknown_device"
 
-def _log_spoofing_attempt(employee_id, device_label, img_file, img_b64, category=""):
-    """Internal helper to log spoofing attempts."""
-    spoofed_image_b64 = ""
+def _image_to_base64(img_file, img_b64):
+    """Common logic to normalize either a base64 string or an uploaded file into a base64 string."""
     try:
         if img_b64:
-            spoofed_image_b64 = img_b64
+            return img_b64
         elif img_file:
             img_file.seek(0)
             file_content = img_file.read()
-            spoofed_image_b64 = base64.b64encode(file_content).decode('utf-8')
+            return base64.b64encode(file_content).decode('utf-8')
     except Exception as e:
-        print(f"🚨 DEBUG: Error processing spoofed image for storage: {e}")
+        print(f"🚨 DEBUG: Error processing image for storage: {e}")
+    return ""
+
+def _log_spoofing_attempt(employee_id, device_label, img_file, img_b64, category=""):
+    """Internal helper to log spoofing attempts."""
+    spoofed_image_b64 = _image_to_base64(img_file, img_b64)
 
     try:
         SpoofingAttempt.objects.create(
@@ -167,7 +171,6 @@ def _log_spoofing_attempt(employee_id, device_label, img_file, img_b64, category
         )
         print("✅ DEBUG: SpoofingAttempt record created.")
     except Exception as e:
-        import traceback
         print(f"🚨 DEBUG: Error creating SpoofingAttempt record: {e}")
         traceback.print_exc()
 
@@ -248,10 +251,6 @@ def verify_face(request):
 def mark_attendance(request):
     image1_b64 = request.data.get('image')
     image1_file = request.FILES.get('image')
-    # Fallback: support frontend sending a single 'image' key
-    if not image1_b64 and not image1_file:
-        image1_b64 = request.data.get('image')
-        image1_file = request.FILES.get('image')
 
     verified_employee_id = request.data.get('verifiedEmployeeID')
     if not verified_employee_id:
@@ -289,13 +288,13 @@ def mark_attendance(request):
         
         # Log the mismatch
         try:
-            from .models import FaceMismatchLog
             FaceMismatchLog.objects.create(
                 verified_employee_id=verified_employee_id,
                 mark_employee_id=meta1['employee_id'],
-                image=image1_b64 if image1_b64 else "",
+                image=_image_to_base64(image1_file, image1_b64),
                 device_id=request.headers.get("X-Device-Id")
             )
+            print("✅ DEBUG: FaceMismatchLog record created.")
         except Exception as e:
             print(f"🚨 Failed to log face mismatch: {e}")
             
@@ -373,9 +372,8 @@ def attendance_report_with_employee_details(request):
             return Response([], status=200)
 
         # ---- Mongo Connection ----
-        mongo_uri = os.environ.get("GLOBAL_DB_HOST")
         db_name = os.environ.get("GLOBAL_DB_NAME", "Global")
-        client = MongoClient(mongo_uri)
+        client = get_mongo_client()
         db = client[db_name]
 
         profiles = db['backend_diagnostics_profile']
@@ -383,7 +381,6 @@ def attendance_report_with_employee_details(request):
         designations = db['backend_diagnostics_Designation']
 
         # ---- SQL Department Map ----
-        from employees.models import Department
         sql_dept_map = {d.name: d.id for d in Department.objects.all()}
 
         # ---- Create Lookup Maps ----
@@ -401,11 +398,15 @@ def attendance_report_with_employee_details(request):
         search_values = []
         if department_filter and department_filter != 'All':
             raw_ids = [d.strip() for d in department_filter.split(',')]
-            
-            # Resolve SQL IDs to names
-            from employees.models import Department as SQLDepartment
-            resolved_sql_names = list(SQLDepartment.objects.filter(id__in=[rid for rid in raw_ids if rid.isdigit()]).values_list('name', flat=True))
-            
+
+            # Resolve SQL IDs to names (reuse sql_dept_map already loaded above
+            # instead of issuing another SQL query)
+            id_to_name = {v: k for k, v in sql_dept_map.items()}
+            resolved_sql_names = [
+                id_to_name[int(rid)] for rid in raw_ids
+                if rid.isdigit() and int(rid) in id_to_name
+            ]
+
             query_names = raw_ids + resolved_sql_names
             
             # Find Mongo codes for these names/codes
@@ -481,8 +482,7 @@ def attendance_report_with_employee_details(request):
         current_emp_id = None
         current_shift_date = None
         last_in_time = None
-        
-        from datetime import time
+
         noon_time = time(12, 0)
         
         for r in records:
@@ -753,15 +753,13 @@ def get_spoofing_attempts(request):
     department = request.GET.get('department')
     if department and department != 'All':
         try:
-            mongo_uri = os.environ.get("GLOBAL_DB_HOST")
             db_name = os.environ.get("GLOBAL_DB_NAME", "Global")
-            client = MongoClient(mongo_uri)
+            client = get_mongo_client()
             db = client[db_name]
-            
+
             raw_values = [d.strip() for d in department.split(',')]
-            
+
             # Resolve numeric IDs to names
-            from employees.models import Department
             numeric_ids = [rv for rv in raw_values if rv.isdigit()]
             resolved_names = list(Department.objects.filter(id__in=numeric_ids).values_list('name', flat=True))
             

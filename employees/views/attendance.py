@@ -15,10 +15,9 @@ from rest_framework.response import Response
 
 from employees.models import Department, Employee, EmployeeAttendance, FaceMismatchLog, SpoofingAttempt
 import base64
-from employees.face_utils import base64_to_encoding, compare_encodings, imagefile_to_encoding, SpoofingDetectedError,match_face_1_to_n
-from pyauth.auth import HasRolePermission
+from employees.face_utils import base64_to_encoding, imagefile_to_encoding, match_face_1_to_n
 
-from .utils import to_list, get_mongo_client
+from .utils import to_list
 
 # --- 🚀 Performance Cache ---
 # Global cache to store employee encodings in memory for faster matching
@@ -27,6 +26,17 @@ _ENCODING_CACHE = {
     'employees': [],     # List of employee metadata
     'last_updated': None
 }
+
+_MONGO_CLIENT = None
+
+def get_mongo_client():
+    """Returns a singleton MongoDB client to avoid reconnecting on every request."""
+    global _MONGO_CLIENT
+    if _MONGO_CLIENT is None:
+        mongo_uri = os.environ.get("GLOBAL_DB_HOST")
+        if mongo_uri:
+            _MONGO_CLIENT = MongoClient(mongo_uri)
+    return _MONGO_CLIENT
 
 def get_optimized_encodings(force_refresh=False):
     """
@@ -51,23 +61,19 @@ def get_optimized_encodings(force_refresh=False):
             # check if active and encoding exists
             if not emp.is_active:
                 continue
-
-            # Use the multi-encoding pool (e.g. 3 angles from registration) if present;
-            # fall back to the single current_face_encoding for employees registered
-            # before this field existed, so nothing existing breaks.
-            raw_list = to_list(emp.face_encodings) if emp.face_encodings else None
-            if not raw_list:
-                raw_list = [emp.current_face_encoding] if emp.current_face_encoding else []
-
-            for raw_enc in raw_list:
-                enc = to_list(raw_enc)
-                if enc and len(enc) == 128:
-                    matrix_list.append(enc)
-                    meta_list.append({
-                        'employee_id': emp.employee_id,
-                        'name': emp.name,
-                        'image_md5': emp.image_md5
-                    })
+                
+            raw_enc = emp.current_face_encoding
+            if not raw_enc:
+                continue
+                
+            enc = to_list(raw_enc)
+            if enc and len(enc) == 128:
+                matrix_list.append(enc)
+                meta_list.append({
+                    'employee_id': emp.employee_id,
+                    'name': emp.name,
+                    'image_md5': emp.image_md5
+                })
         
         if matrix_list:
             _ENCODING_CACHE['matrix'] = np.array(matrix_list)
@@ -245,12 +251,12 @@ def verify_face(request):
 def mark_attendance(request):
     image1_b64 = request.data.get('image')
     image1_file = request.FILES.get('image')
-    # Fallback: support frontend sending a single 'image' key
-    # if not image1_b64 and not image1_file:
-    #     image1_b64 = request.data.get('image')
-    #     image1_file = request.FILES.get('image')
 
-    employee_id = request.data.get('auth-user-id')
+    verified_employee_id = request.data.get('verifiedEmployeeID')
+    if not verified_employee_id:
+        return Response({"error": "verifiedEmployeeID is required"}, status=400)
+
+    print(f"[mark_attendance] Keys received — data: {list(request.data.keys())}, files: {list(request.FILES.keys())}")
 
     # 0. Identify Device by Fingerprint
     device_label = _get_device_label(request)
@@ -258,8 +264,10 @@ def mark_attendance(request):
     # 1. Extract Encoding & Liveness for image
     enc1, is_real1 = _extract_face(image1_file, image1_b64)
 
-    if not enc1 and not enc2:
-        return Response({"error": "No face found in images"}, status=400)
+    print(f"[mark_attendance] enc1={'ok' if enc1 else 'EMPTY'}")
+
+    if not enc1:
+        return Response({"error": "No face found in image"}, status=400)
 
     # 2. Find Matching Employee
     meta1, dist1, err1 = _match_face(enc1)
@@ -298,26 +306,6 @@ def mark_attendance(request):
     best_distance = dist1
     matched_meta = meta1
     is_real = is_real1
-    
-    if meta1 and meta2:
-        if meta1['employee_id'] != meta2['employee_id']:
-            print(f"❌ Rejected: Inconsistent match ({meta1['name']} vs {meta2['name']})")
-            return Response({"error": "Face match inconsistent across frames. Please hold still and try again."}, status=400)
-        best_distance = max(dist1, dist2)
-        is_real = is_real1 and is_real2
-        matched_meta = meta1
-    elif meta1:
-        best_distance = dist1
-        matched_meta = meta1
-        is_real = is_real1
-    elif meta2:
-        best_distance = dist2
-        matched_meta = meta2
-        is_real = is_real2
-        
-    if best_distance > MATCH_THRESHOLD:
-        print(f"❌ Rejected: Best distance {best_distance:.4f} is above threshold {MATCH_THRESHOLD}")
-        return Response({"error": "User Not Found. Face match not confident enough."}, status=404)
         
     print(f"🏆 FINAL WINNER: {matched_meta['name']} (Dist: {best_distance:.4f})")
 

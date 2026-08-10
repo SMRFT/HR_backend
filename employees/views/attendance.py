@@ -14,7 +14,7 @@ from rest_framework.response import Response
 
 from employees.models import Employee, EmployeeAttendance, SpoofingAttempt
 import base64
-from employees.face_utils import base64_to_encoding, compare_encodings, imagefile_to_encoding, SpoofingDetectedError, match_face_1_to_n
+from employees.face_utils import base64_to_encoding, compare_encodings, imagefile_to_encoding, SpoofingDetectedError,match_face_1_to_n
 from pyauth.auth import HasRolePermission
 
 from .utils import to_list, get_mongo_client
@@ -246,11 +246,7 @@ def mark_attendance(request):
     #     image1_b64 = request.data.get('image')
     #     image1_file = request.FILES.get('image')
 
-    verified_employee_id = request.data.get('verifiedEmployeeID')
-    if not verified_employee_id:
-        return Response({"error": "verifiedEmployeeID is required"}, status=400)
-
-    print(f"[mark_attendance] Keys received — data: {list(request.data.keys())}, files: {list(request.FILES.keys())}")
+    employee_id = request.data.get('auth-user-id')
 
     # 0. Identify Device by Fingerprint
     device_label = _get_device_label(request)
@@ -258,10 +254,8 @@ def mark_attendance(request):
     # 1. Extract Encoding & Liveness for image
     enc1, is_real1 = _extract_face(image1_file, image1_b64)
 
-    print(f"[mark_attendance] enc1={'ok' if enc1 else 'EMPTY'}")
-
-    if not enc1:
-        return Response({"error": "No face found in image"}, status=400)
+    if not enc1 and not enc2:
+        return Response({"error": "No face found in images"}, status=400)
 
     # 2. Find Matching Employee
     meta1, dist1, err1 = _match_face(enc1)
@@ -300,6 +294,26 @@ def mark_attendance(request):
     best_distance = dist1
     matched_meta = meta1
     is_real = is_real1
+    
+    if meta1 and meta2:
+        if meta1['employee_id'] != meta2['employee_id']:
+            print(f"❌ Rejected: Inconsistent match ({meta1['name']} vs {meta2['name']})")
+            return Response({"error": "Face match inconsistent across frames. Please hold still and try again."}, status=400)
+        best_distance = max(dist1, dist2)
+        is_real = is_real1 and is_real2
+        matched_meta = meta1
+    elif meta1:
+        best_distance = dist1
+        matched_meta = meta1
+        is_real = is_real1
+    elif meta2:
+        best_distance = dist2
+        matched_meta = meta2
+        is_real = is_real2
+        
+    if best_distance > MATCH_THRESHOLD:
+        print(f"❌ Rejected: Best distance {best_distance:.4f} is above threshold {MATCH_THRESHOLD}")
+        return Response({"error": "User Not Found. Face match not confident enough."}, status=404)
         
     print(f"🏆 FINAL WINNER: {matched_meta['name']} (Dist: {best_distance:.4f})")
 

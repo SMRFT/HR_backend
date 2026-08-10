@@ -17,7 +17,7 @@ import base64
 from employees.face_utils import base64_to_encoding, compare_encodings, imagefile_to_encoding, SpoofingDetectedError,match_face_1_to_n
 from pyauth.auth import HasRolePermission
 
-from .utils import to_list
+from .utils import to_list, get_mongo_client
 
 # --- 🚀 Performance Cache ---
 # Global cache to store employee encodings in memory for faster matching
@@ -50,18 +50,23 @@ def get_optimized_encodings(force_refresh=False):
             # check if active and encoding exists
             if not emp.is_active:
                 continue
-                
-            raw_enc = emp.current_face_encoding
-            if not raw_enc:
-                continue
-                
-            enc = to_list(raw_enc)
-            if enc and len(enc) == 128:
-                matrix_list.append(enc)
-                meta_list.append({
-                    'employee_id': emp.employee_id,
-                    'name': emp.name
-                })
+
+            # Use the multi-encoding pool (e.g. 3 angles from registration) if present;
+            # fall back to the single current_face_encoding for employees registered
+            # before this field existed, so nothing existing breaks.
+            raw_list = to_list(emp.face_encodings) if emp.face_encodings else None
+            if not raw_list:
+                raw_list = [emp.current_face_encoding] if emp.current_face_encoding else []
+
+            for raw_enc in raw_list:
+                enc = to_list(raw_enc)
+                if enc and len(enc) == 128:
+                    matrix_list.append(enc)
+                    meta_list.append({
+                        'employee_id': emp.employee_id,
+                        'name': emp.name,
+                        'image_md5': emp.image_md5
+                    })
         
         if matrix_list:
             _ENCODING_CACHE['matrix'] = np.array(matrix_list)
@@ -74,66 +79,218 @@ def get_optimized_encodings(force_refresh=False):
             
     return _ENCODING_CACHE['matrix'], _ENCODING_CACHE['employees']
 
-@api_view(['POST'])
-# @permission_classes([HasRolePermission])
-def mark_attendance(request):
-    image1_b64 = request.data.get('image1')
-    image2_b64 = request.data.get('image2')
-    image1_file = request.FILES.get('image1')
-    image2_file = request.FILES.get('image2')
+def _save_attendance_record(employee_id, device_id, mode, confidence):
+    """
+    Internal helper to save attendance data into the database.
+    Can be reused by other functions without exposing new URLs.
+    """
+    return EmployeeAttendance.objects.create(
+        employee_id=employee_id,
+        device_id=device_id,
+        attendence_type=mode,
+        confidence=confidence
+    )
+
+def _extract_face(img_file, img_b64):
+    """Common logic for face extraction."""
+    try:
+        if img_file:
+            return imagefile_to_encoding(img_file)
+        elif img_b64:
+            return base64_to_encoding(img_b64)
+        return None, True
+    except Exception as e:
+        print(f"🚨 DEBUG: Error extracting face: {e}")
+        return None, True
+
+def _match_face(enc):
+    """Common logic for finding a face match in the optimized encodings."""
+    known_matrix, employee_meta = get_optimized_encodings()
     
-    # Fallback for old single-image payload
-    if not image1_b64 and not image1_file:
-        image1_b64 = request.data.get('image')
-        image1_file = request.FILES.get('image')
+    if known_matrix.size == 0:
+        return None, 999.0, "No registered employees found"
+
+    meta, dist, err = match_face_1_to_n(enc, known_matrix, employee_meta, threshold=0.45, min_margin=0.05) if enc else (None, 999.0, "No encoding")
+    
+    if err:
+        return meta, dist, err
+
+    return meta, dist, None
+
+def _get_device_label(request):
+    """Internal helper to identify the device label using fingerprint."""
+    fingerprint = request.headers.get('X-Device-Id') or request.data.get('fingerprint')
+    if not fingerprint:
+        return "unknown_device"
+    
+    try:
+        client = get_mongo_client()
+        if not client: return "unknown_device"
+        db_name = os.environ.get("GLOBAL_DB_NAME_HR", "HR")
+        db = client[db_name]
+        allowed_devices_col = db['employees_alloweddevice']
+        
+        device_doc = allowed_devices_col.find_one({"fingerprint": fingerprint})
+        if device_doc:
+            return device_doc.get("label") or "Registered Device"
+    except Exception as e:
+        print(f"🚨 DEBUG: Error identifying device: {e}")
+        
+    return "unknown_device"
+
+def _log_spoofing_attempt(employee_id, device_label, img_file, img_b64, category=""):
+    """Internal helper to log spoofing attempts."""
+    spoofed_image_b64 = ""
+    try:
+        if img_b64:
+            spoofed_image_b64 = img_b64
+        elif img_file:
+            img_file.seek(0)
+            file_content = img_file.read()
+            spoofed_image_b64 = base64.b64encode(file_content).decode('utf-8')
+    except Exception as e:
+        print(f"🚨 DEBUG: Error processing spoofed image for storage: {e}")
+
+    try:
+        SpoofingAttempt.objects.create(
+            employee_id=employee_id,
+            device_id=device_label,
+            image=spoofed_image_b64,
+            category=category
+        )
+        print("✅ DEBUG: SpoofingAttempt record created.")
+    except Exception as e:
+        import traceback
+        print(f"🚨 DEBUG: Error creating SpoofingAttempt record: {e}")
+        traceback.print_exc()
+
+def _get_registered_image(image_md5):
+    """Internal helper to fetch the registered image from MongoDB GridFS."""
+    if not image_md5:
+        return None
+    try:
+        client = get_mongo_client()
+        if not client: return None
+        
+        hr_db_name = os.environ.get("GLOBAL_DB_NAME_HR", "HR")
+        global_db_name = os.environ.get("GLOBAL_DB_NAME_GLOBAL", "Global")
+        
+        fs_hr = gridfs.GridFS(client[hr_db_name])
+        fs_global = gridfs.GridFS(client[global_db_name])
+        
+        file_obj = fs_hr.find_one({"md5": image_md5})
+        if not file_obj:
+            file_obj = fs_global.find_one({"md5": image_md5})
+            
+        if file_obj:
+            img_bytes = file_obj.read()
+            return f"data:image/jpeg;base64,{base64.b64encode(img_bytes).decode('utf-8')}"
+    except Exception as e:
+        print(f"🚨 DEBUG: Error fetching registered image for preview: {e}")
+    return None
+
+
+@api_view(['POST'])
+def verify_face(request):
+    """
+    Fast verification endpoint for the first frame in a dual-image sequence.
+    Returns success if a confident face match is found, otherwise fails fast.
+    """
+    image_b64 = request.data.get('image')
+    image_file = request.FILES.get('image')
+    
+    if not image_b64 and not image_file:
+        return Response({"error": "Image is required"}, status=400)
+
+    # Identify Device by Fingerprint
+    device_label = _get_device_label(request)
+
+    enc, is_real = _extract_face(image_file, image_b64)
+
+    if not enc:
+        return Response({"error": "No face found or error processing image"}, status=400)
+
+    matched_meta, best_distance, err = _match_face(enc)
+    
+    # 🚨 CHECK SPOOFING FIRST, EVEN IF FACE IS UNRECOGNIZED
+    if not is_real:
+        emp_id = matched_meta['employee_id'] if matched_meta else "unknown"
+        print(f"🚨 DEBUG: Spoofing detected (Liveness Check Failed) for {emp_id}!")
+        _log_spoofing_attempt(emp_id, device_label, image_file, image_b64, category="SPFV")
+        return Response({"error": "Spoofing detected! Real face required."}, status=400)
+        
+    if err:
+        return Response({"error": err}, status=404)
+        
+    print(f"🏆 VERIFY MATCH: {matched_meta['name']} (Dist: {best_distance:.4f})")
+        
+    if device_label in ["unknown_device", "Unknown Device"]:
+        print(f"🚨 DEBUG: Device spoofing detected for employee {matched_meta['employee_id']}!")
+        _log_spoofing_attempt(matched_meta['employee_id'], device_label, image_file, image_b64, category="UNDV")
+        return Response({"error": "Unrecognized device. Access denied."}, status=403)
+        
+    return Response({
+        "success": True, 
+        "employee_id": matched_meta['employee_id'],
+        "name": matched_meta['name'],
+        "confidence": best_distance
+    }, status=200)
+
+    
+@api_view(['POST'])
+def mark_attendance(request):
+    image1_b64 = request.data.get('image')
+    image1_file = request.FILES.get('image')
+    # Fallback: support frontend sending a single 'image' key
+    # if not image1_b64 and not image1_file:
+    #     image1_b64 = request.data.get('image')
+    #     image1_file = request.FILES.get('image')
 
     employee_id = request.data.get('auth-user-id')
 
     # 0. Identify Device by Fingerprint
-    fingerprint = request.headers.get('X-Device-Id') or request.data.get('fingerprint')
-    device_label = "unknown_device"
-    
-    if fingerprint:
-        try:
-            mongo_uri = os.environ.get("GLOBAL_DB_HOST")
-            db_name = os.environ.get("GLOBAL_DB_NAME_HR", "HR") # Consistent with auth.py
-            client = MongoClient(mongo_uri)
-            db = client[db_name]
-            allowed_devices_col = db['employees_alloweddevice']
-            
-            device_doc = allowed_devices_col.find_one({"fingerprint": fingerprint})
-            if device_doc:
-                device_label = device_doc.get("label", "Unknown Device")
-        except Exception as e:
-            print(f"🚨 DEBUG: Error identifying device: {e}")
+    device_label = _get_device_label(request)
 
-    def extract_face(img_file, img_b64):
-        try:
-            if img_file:
-                return imagefile_to_encoding(img_file)
-            elif img_b64:
-                return base64_to_encoding(img_b64)
-            return None, True
-        except Exception as e:
-            print(f"🚨 DEBUG: Error extracting face: {e}")
-            return None, True
-
-    # 1. Extract Encoding & Liveness for both images
-    enc1, is_real1 = extract_face(image1_file, image1_b64)
-    enc2, is_real2 = extract_face(image2_file, image2_b64)
+    # 1. Extract Encoding & Liveness for image
+    enc1, is_real1 = _extract_face(image1_file, image1_b64)
 
     if not enc1 and not enc2:
         return Response({"error": "No face found in images"}, status=400)
 
-    # 2. Find Matching Employee (Vectorized Optimization)
-    known_matrix, employee_meta = get_optimized_encodings()
+    # 2. Find Matching Employee
+    meta1, dist1, err1 = _match_face(enc1)
     
-    if known_matrix.size == 0:
-        return Response({"error": "No registered employees found"}, status=404)
+    # 🚨 CHECK SPOOFING FIRST, EVEN IF FACE MISMATCHES OR IS UNRECOGNIZED
+    if not is_real1:
+        emp_id = meta1['employee_id'] if meta1 else verified_employee_id
+        print(f"🚨 DEBUG: Spoofing detected (Liveness Check Failed) for employee {emp_id}!")
+        _log_spoofing_attempt(emp_id, device_label, image1_file, image1_b64, category="SPFM")
+        return Response({"error": "Spoofing detected! Real face required."}, status=400)
+    
+    if err1:
+        print(f"❌ Rejected: {err1}")
+        return Response({"error": err1}, status=404)
 
-    meta1, dist1, err1 = match_face_1_to_n(enc1, known_matrix, employee_meta, threshold=0.45, min_margin=0.05) if enc1 else (None, 999.0, "No encoding 1")
-    
-    MATCH_THRESHOLD = 0.45
+    if str(meta1['employee_id']) != str(verified_employee_id):
+        print(f"❌ Rejected: Face mismatch. Expected {verified_employee_id}, found {meta1['employee_id']}")
+        
+        # Log the mismatch
+        try:
+            from .models import FaceMismatchLog
+            FaceMismatchLog.objects.create(
+                verified_employee_id=verified_employee_id,
+                mark_employee_id=meta1['employee_id'],
+                image=image1_b64 if image1_b64 else "",
+                device_id=request.headers.get("X-Device-Id")
+            )
+        except Exception as e:
+            print(f"🚨 Failed to log face mismatch: {e}")
+            
+        return Response({
+            "error": "Face mismatch. Please hold still and try again.",
+            "markEmployeeID": meta1['employee_id']
+        }, status=400)
+        
     best_distance = dist1
     matched_meta = meta1
     is_real = is_real1
@@ -158,77 +315,32 @@ def mark_attendance(request):
         print(f"❌ Rejected: Best distance {best_distance:.4f} is above threshold {MATCH_THRESHOLD}")
         return Response({"error": "User Not Found. Face match not confident enough."}, status=404)
         
-    # Fetch actual employee object
-    matched_employee = Employee.objects.filter(employee_id=matched_meta['employee_id']).first()
-
     print(f"🏆 FINAL WINNER: {matched_meta['name']} (Dist: {best_distance:.4f})")
 
     # 5. Handle Spoofing (Only if User Found)
-    if not is_real:
-        print(f"🚨 DEBUG: Spoofing detected (Liveness Check Failed) for employee {matched_employee.employee_id}!")
-        
-        # 🚨 Capture Spoofing Attempt
-        spoofed_image_b64 = ""
-        try:
-            if image1_b64:
-                spoofed_image_b64 = image1_b64
-            elif image1_file:
-                image1_file.seek(0)
-                file_content = image1_file.read()
-                spoofed_image_b64 = base64.b64encode(file_content).decode('utf-8')
-        except Exception as e:
-            print(f"🚨 DEBUG: Error processing spoofed image for storage: {e}")
-
-        try:
-            SpoofingAttempt.objects.create(
-                employee_id=matched_employee.employee_id,  # Matched ID
-                device_id=device_label,
-                image=spoofed_image_b64
-            )
-            print("✅ DEBUG: SpoofingAttempt record created.")
-        except Exception as e:
-            print(f"🚨 DEBUG: Error creating SpoofingAttempt record: {e}")
-
-        return Response({"error": "Spoofing detected! Real face required."}, status=400)
+    if device_label in ["unknown_device", "Unknown Device"]:
+        print(f"🚨 DEBUG: Device spoofing detected for employee {matched_meta['employee_id']}!")
+        _log_spoofing_attempt(matched_meta['employee_id'], device_label, image1_file, image1_b64, category="UNDM")
+        return Response({"error": "Unrecognized device. Access denied."}, status=403)
 
     # 6. Mark Attendance (Success)
     mode = request.data.get('mode', 'IN')
 
-    att = EmployeeAttendance.objects.create(
-        employee_id=matched_employee.employee_id,
+    att = _save_attendance_record(
+        employee_id=matched_meta['employee_id'],
         device_id=device_label,
-        attendence_type=mode,
+        mode=mode,
         confidence=best_distance
     )
 
-    print(f"✅ ATTENDANCE SUCCESS: {matched_employee.name} (ID: {matched_employee.employee_id}) | Liveness Verified: {is_real}")
+    print(f"✅ ATTENDANCE SUCCESS: {matched_meta['name']} (ID: {matched_meta['employee_id']}) | Liveness Verified: {is_real}")
 
     # Fetch the registered image preview to display on the kiosk
-    base64_img = None
-    if matched_employee.image_md5:
-        try:
-            mongo_uri = os.environ.get("GLOBAL_DB_HOST")
-            client = MongoClient(mongo_uri)
-            
-            hr_db_name = os.environ.get("GLOBAL_DB_NAME_HR", "HR")
-            global_db_name = os.environ.get("GLOBAL_DB_NAME_GLOBAL", "Global")
-            
-            fs_hr = gridfs.GridFS(client[hr_db_name])
-            fs_global = gridfs.GridFS(client[global_db_name])
-            
-            file_obj = fs_hr.find_one({"md5": matched_employee.image_md5})
-            if not file_obj:
-                file_obj = fs_global.find_one({"md5": matched_employee.image_md5})
-                
-            if file_obj:
-                img_bytes = file_obj.read()
-                base64_img = f"data:image/jpeg;base64,{base64.b64encode(img_bytes).decode('utf-8')}"
-        except Exception as e:
-            print(f"🚨 DEBUG: Error fetching registered image for preview: {e}")
+    base64_img = _get_registered_image(matched_meta.get('image_md5'))
 
     return Response({
-        "employee": matched_employee.employee_id,
-        "name": matched_employee.name,
+        "employee": matched_meta['employee_id'],
+        "name": matched_meta['name'],
         "mode": att.attendence_type,
         "timestamp": att.attendence_time.astimezone(IST),
         "confidence": best_distance,
@@ -268,9 +380,8 @@ def attendance_report_with_employee_details(request):
             return Response([], status=200)
 
         # ---- Mongo Connection ----
-        mongo_uri = os.environ.get("GLOBAL_DB_HOST")
         db_name = os.environ.get("GLOBAL_DB_NAME", "Global")
-        client = MongoClient(mongo_uri)
+        client = get_mongo_client()
         db = client[db_name]
 
         profiles = db['backend_diagnostics_profile']
@@ -602,55 +713,7 @@ def attendance_report_with_employee_details(request):
         return JsonResponse({"error": str(e)}, status=500)
 
 
-@api_view(['POST'])
-def verify_face(request):
-    """
-    Fast verification endpoint for the first frame in a dual-image sequence.
-    Returns success if a confident face match is found, otherwise fails fast.
-    """
-    image_b64 = request.data.get('image')
-    image_file = request.FILES.get('image')
-    
-    if not image_b64 and not image_file:
-        return Response({"error": "Image is required"}, status=400)
 
-    try:
-        if image_file:
-            enc, is_real = imagefile_to_encoding(image_file)
-        else:
-            enc, is_real = base64_to_encoding(image_b64)
-    except Exception as e:
-        print(f"🚨 DEBUG: Error extracting face for verify-face: {e}")
-        return Response({"error": "Error processing image"}, status=400)
-
-    if not enc:
-        return Response({"error": "No face found in image"}, status=400)
-
-    known_matrix, employee_meta = get_optimized_encodings()
-    
-    if known_matrix.size == 0:
-        return Response({"error": "No registered employees found"}, status=404)
-
-    enc_np = np.array(enc)
-    distances = np.linalg.norm(known_matrix - enc_np, axis=1)
-    
-    best_idx = np.argmin(distances)
-    best_distance = float(distances[best_idx])
-    matched_meta = employee_meta[best_idx]
-    
-    MATCH_THRESHOLD = 0.50
-    if best_distance > MATCH_THRESHOLD:
-        return Response({"error": "User Not Found. Face match not confident enough."}, status=404)
-        
-    if not is_real:
-        # Spoofing detected, fail fast
-        return Response({"error": "Spoofing detected (Liveness Check Failed)"}, status=403)
-        
-    return Response({
-        "success": True, 
-        "employee_id": matched_meta['employee_id'],
-        "name": matched_meta['name']
-    }, status=200)
 
 
 @api_view(['GET'])
@@ -696,11 +759,10 @@ def get_spoofing_attempts(request):
     department = request.GET.get('department')
     if department and department != 'All':
         try:
-            mongo_uri = os.environ.get("GLOBAL_DB_HOST")
             db_name = os.environ.get("GLOBAL_DB_NAME", "Global")
-            client = MongoClient(mongo_uri)
+            client = get_mongo_client()
             db = client[db_name]
-            
+
             raw_values = [d.strip() for d in department.split(',')]
             
             # Resolve numeric IDs to names

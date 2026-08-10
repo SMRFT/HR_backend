@@ -247,6 +247,8 @@ def verify_face(request):
     }, status=200)
 
     
+
+
 @api_view(['POST'])
 def mark_attendance(request):
     image1_b64 = request.data.get('image')
